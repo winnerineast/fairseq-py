@@ -7,8 +7,10 @@
 #
 
 import torch
-from torch.autograd import Variable, Function
+from torch.autograd import Function
 from torch.nn.modules.utils import _single
+
+from fairseq import utils
 
 try:
     from fairseq import temporal_convolution_tbc
@@ -59,7 +61,7 @@ class ConvTBCFunction(Function):
         kernel_size = weight_size[0]
 
         output = input.new(
-            input_size[0] - kernel_size + 1 + pad * 2,
+            input_size[0] - kernel_size + 1 + int(pad * 2),
             input_size[1],
             weight_size[2])
 
@@ -93,9 +95,9 @@ class ConvTBCFunction(Function):
             input,
             weight)
 
-        grad_input = Variable(grad_input, volatile=True)
-        grad_weight = Variable(grad_weight, volatile=True)
-        grad_bias = Variable(grad_bias, volatile=True)
+        grad_input = utils.volatile_variable(grad_input)
+        grad_weight = utils.volatile_variable(grad_weight)
+        grad_bias = utils.volatile_variable(grad_bias)
 
         return grad_input, grad_weight, grad_bias, None
 

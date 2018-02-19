@@ -10,13 +10,15 @@
 Train a network on multiple GPUs using multiprocessing.
 """
 
+from itertools import cycle, islice
+import math
 import torch
 from torch.optim.lr_scheduler import LambdaLR, ReduceLROnPlateau
 
 from fairseq import nccl, utils
-from fairseq.criterions import FairseqCriterion
 from fairseq.multiprocessing_event_loop import MultiprocessingEventLoop, Future
-from fairseq.nag import NAG
+from fairseq.optim.nag import NAG
+from fairseq.optim.adam import Adam
 
 
 class MultiprocessingTrainer(MultiprocessingEventLoop):
@@ -31,7 +33,9 @@ class MultiprocessingTrainer(MultiprocessingEventLoop):
     (prefixed with `_async_`), which run on each process in parallel.
     """
 
-    def __init__(self, args, model, device_ids=None,
+    OPTIMIZERS = ['adagrad', 'adam', 'nag', 'sgd']
+
+    def __init__(self, args, model, criterion, device_ids=None,
                  multiprocessing_method='spawn'):
         if device_ids is None:
             device_ids = tuple(range(torch.cuda.device_count()))
@@ -41,19 +45,19 @@ class MultiprocessingTrainer(MultiprocessingEventLoop):
             raise NotImplementedError('Training on CPU is not supported')
         model = model.share_memory()
         nccl_uid = nccl.get_unique_id()
+        self.criterion = criterion
 
         Future.gen_list([
             self.call_async(rank, '_async_init', args=args, model=model,
-                            nccl_uid=nccl_uid)
+                            criterion=criterion, nccl_uid=nccl_uid)
             for rank in range(self.num_replicas)
         ])
 
-    def _async_init(self, rank, device_id, args, model, nccl_uid):
+        self._grads_initialized = False
+
+    def _async_init(self, rank, device_id, args, model, criterion, nccl_uid):
         """Initialize child processes."""
         self.args = args
-
-        # set torch.seed in this process
-        torch.manual_seed(args.seed)
 
         # set CUDA device
         torch.cuda.set_device(device_id)
@@ -61,30 +65,73 @@ class MultiprocessingTrainer(MultiprocessingEventLoop):
         # initialize NCCL
         nccl.initialize(self.num_replicas, nccl_uid, device_id)
 
-        # copy model to current device
+        # copy model and criterion to current device
         self.model = model.cuda()
+        self.criterion = criterion.cuda()
 
-        # initialize optimizer
-        self.optimizer = NAG(self.model.parameters(), lr=self.args.lr,
-                             momentum=self.args.momentum,
-                             weight_decay=self.args.weight_decay)
-        self.flat_grads = None
-
-        # initialize LR scheduler
+        # initialize optimizer and LR scheduler
+        self.args.lr = list(map(float, self.args.lr.split(',')))
+        self.optimizer = self._build_optimizer()
         self.lr_scheduler = self._build_lr_scheduler()
 
+        self.loss = None
+        self._max_bsz_seen = 0
+
+    def _build_optimizer(self):
+        # When resuming training from a checkpoint, we load the old optimizer
+        # state that includes things like learning rate, momentum factor, etc.
+        # We use this dictionary to override values stored in the checkpoint,
+        # e.g., we might prefer the values specified on the command line.
+        self._override_optim_state = {}
+
+        if self.args.optimizer == 'adagrad':
+            self._override_optim_state = {
+                'lr': self.args.lr[0],
+                'weight_decay': self.args.weight_decay,
+            }
+            return torch.optim.Adagrad(self.model.parameters(), **self._override_optim_state)
+        elif self.args.optimizer == 'adam':
+            self._override_optim_state = {
+                'lr': self.args.lr[0],
+                'betas': eval(self.args.adam_betas),
+                'weight_decay': self.args.weight_decay,
+            }
+            return Adam(self.model.parameters(), **self._override_optim_state)
+        elif self.args.optimizer == 'nag':
+            self._override_optim_state = {
+                'lr': self.args.lr[0],
+                'momentum': self.args.momentum,
+                'weight_decay': self.args.weight_decay,
+            }
+            return NAG(self.model.parameters(), **self._override_optim_state)
+        elif self.args.optimizer == 'sgd':
+            self._override_optim_state = {
+                'lr': self.args.lr[0],
+                'momentum': self.args.momentum,
+                'weight_decay': self.args.weight_decay,
+            }
+            return torch.optim.SGD(self.model.parameters(), **self._override_optim_state)
+        else:
+            raise ValueError('Unknown optimizer: {}'.format(self.args.optimizer))
+
     def _build_lr_scheduler(self):
-        if self.args.force_anneal > 0:
+        if len(self.args.lr) > 1 or self.args.force_anneal > 0:
+            lrs = self.args.lr
+
             def anneal(e):
                 if e < self.args.force_anneal:
-                    return 1
+                    # use fixed LR schedule
+                    next_lr = lrs[min(e, len(lrs) - 1)]
                 else:
-                    return self.args.lrshrink ** (e + 1 - self.args.force_anneal)
+                    next_lr = lrs[-1] * self.args.lrshrink ** (e + 1 - self.args.force_anneal)
+                return next_lr / lrs[0]  # correct for scaling from LambdaLR
+
             lr_scheduler = LambdaLR(self.optimizer, anneal)
             lr_scheduler.best = None
         else:
-            # decay the LR by 0.1 every time the validation loss plateaus
-            lr_scheduler = ReduceLROnPlateau(self.optimizer, patience=0)
+            # decay the LR by a factor every time the validation loss plateaus
+            lr_scheduler = ReduceLROnPlateau(self.optimizer, patience=0,
+                                             factor=self.args.lrshrink)
         return lr_scheduler
 
     def get_model(self):
@@ -95,14 +142,13 @@ class MultiprocessingTrainer(MultiprocessingEventLoop):
     def _async_get_model(self, rank, device_id):
         return self.model
 
-    def save_checkpoint(self, args, epoch, batch_offset, val_loss=None):
+    def save_checkpoint(self, filename, extra_state):
         """Save a checkpoint for the current model."""
-        self.call_async(0, '_async_save_checkpoint', args=args, epoch=epoch,
-                        batch_offset=batch_offset, val_loss=val_loss).gen()
+        self.call_async(0, '_async_save_checkpoint', filename=filename, extra_state=extra_state).gen()
 
-    def _async_save_checkpoint(self, rank, device_id, args, epoch, batch_offset, val_loss):
-        utils.save_checkpoint(args, epoch, batch_offset, self.model,
-                              self.optimizer, self.lr_scheduler, val_loss)
+    def _async_save_checkpoint(self, rank, device_id, filename, extra_state):
+        utils.save_state(filename, self.args, self.model, self.criterion, self.optimizer,
+                         self.lr_scheduler, self._optim_history, extra_state)
 
     def load_checkpoint(self, filename):
         """Load a checkpoint into the model replicas in each process."""
@@ -110,111 +156,187 @@ class MultiprocessingTrainer(MultiprocessingEventLoop):
             self.call_async(rank, '_async_load_checkpoint', filename=filename)
             for rank in range(self.num_replicas)
         ])
-        epoch, batch_offset = results[0]
-        return epoch, batch_offset
+        extra_state = results[0]
+        return extra_state
 
     def _async_load_checkpoint(self, rank, device_id, filename):
-        return utils.load_checkpoint(filename, self.model, self.optimizer,
-                                     self.lr_scheduler, cuda_device=device_id)
+        extra_state, self._optim_history, last_optim_state = utils.load_model_state(
+            filename, self.model, cuda_device=device_id)
 
-    def train_step(self, samples, criterion):
+        if last_optim_state is not None:
+            # rebuild optimizer after loading model, since params may have changed
+            self.optimizer = self._build_optimizer()
+            self.lr_scheduler = self._build_lr_scheduler()
+
+            # only load optimizer and lr_scheduler if they match the checkpoint
+            last_optim = self._optim_history[-1]
+            if last_optim['criterion_name'] == self.criterion.__class__.__name__:
+                self.optimizer.load_state_dict(last_optim_state)
+                self.lr_scheduler.best = last_optim['best_loss']
+
+        # override learning rate, momentum, etc. with latest values
+        for group in self.optimizer.param_groups:
+            group.update(self._override_optim_state)
+
+        return extra_state
+
+    def set_seed(self, seed):
+        Future.gen_list([
+            self.call_async(rank, '_async_set_seed', seed=seed)
+            for rank in range(self.num_replicas)
+        ])
+
+    def _async_set_seed(self, rank, device_id, seed):
+        torch.manual_seed(seed)
+
+    def train_step(self, samples):
         """Do forward, backward and gradient step in parallel."""
-        assert isinstance(criterion, FairseqCriterion)
+        # PyTorch initializes gradient buffers lazily, so the first
+        # train step needs to send non-empty samples to all replicas
+        replace_empty_samples = False
+        if not self._grads_initialized:
+            replace_empty_samples = True
+            self._grads_initialized = True
 
         # scatter sample across GPUs
-        samples, data_events = self._scatter_samples(samples)
-        criterion.prepare(samples)
+        self._scatter_samples(samples, replace_empty_samples=replace_empty_samples)
 
-        # forward pass, backward pass and gradient step
-        losses = [
-            self.call_async(rank, '_async_train_step', sample=samples[rank],
-                            criterion=criterion, data_event=event)
-            for rank, event in enumerate(data_events)
-        ]
+        # forward pass
+        sample_sizes, logging_outputs, ooms_fwd = Future.gen_tuple_list([
+            self.call_async(rank, '_async_forward')
+            for rank in range(self.num_replicas)
+        ])
 
-        # aggregate losses and gradient norms
-        losses, grad_norms = Future.gen_tuple_list(losses)
-        loss = criterion.aggregate(losses)
+        # backward pass, all-reduce gradients and take an optimization step
+        grad_denom = self.criterion.__class__.grad_denom(sample_sizes)
+        grad_norms, ooms_bwd = Future.gen_tuple_list([
+            self.call_async(rank, '_async_backward_and_opt', grad_denom=grad_denom)
+            for rank in range(self.num_replicas)
+        ])
 
-        return loss, grad_norms[0]
+        # aggregate logging output
+        logging_output = self.criterion.__class__.aggregate_logging_outputs(logging_outputs)
+        logging_output['gnorm'] = grad_norms[0]  # log the gradient norm
+        logging_output['oom'] = sum(ooms_fwd) + sum(ooms_bwd)
 
-    def _async_train_step(self, rank, device_id, sample, criterion, data_event):
-        data_event.wait()
-        self.model.train()
+        return logging_output
 
-        # zero grads even if net_input is None, since we will all-reduce them
-        self.optimizer.zero_grad()
+    def _async_forward(self, rank, device_id, eval=False):
+        if eval:
+            self.model.eval()
+        else:
+            self.model.train()
+            self.optimizer.zero_grad()
 
-        # calculate loss and grads
-        loss = 0
-        if sample is not None:
-            net_output = self.model(**sample['net_input'])
-            loss_ = criterion(net_output, sample)
-            loss_.backward()
-            loss = loss_.data[0]
+        with utils.maybe_no_grad(eval):
+            sample_size, logging_output, oom = 0, {}, False
+            if self._sample is not None:
+                try:
+                    # calculate loss and sample size
+                    self.loss, sample_size, logging_output = self.criterion(self.model, self._sample)
+                except RuntimeError as e:
+                    if not eval and 'out of memory' in str(e):
+                        print('| WARNING: ran out of memory on GPU #{}, skipping batch'.format(device_id))
+                        oom = True
+                        self.loss = None
+                        if hasattr(torch.cuda, 'empty_cache'):
+                            torch.cuda.empty_cache()
+                    else:
+                        raise e
 
-        # flatten grads into a contiguous block of memory
-        if self.flat_grads is None:
-            self.flat_grads = self._flatten_grads_(self.model)
+        return sample_size, logging_output, oom
 
-        # all-reduce grads
-        nccl.all_reduce(self.flat_grads)
+    def _async_backward_and_opt(self, rank, device_id, grad_denom):
+        oom = False
+        if self.loss is not None:
+            try:
+                # backward pass
+                self.loss.backward()
+            except RuntimeError as e:
+                if 'out of memory' in str(e):
+                    print('| WARNING: ran out of memory on GPU #{}, skipping batch'.format(device_id))
+                    oom = True
+                    if hasattr(torch.cuda, 'empty_cache'):
+                        torch.cuda.empty_cache()
+                    self.optimizer.zero_grad()
+                else:
+                    raise e
+
+        # all-reduce grads and rescale by grad_denom
+        self._all_reduce_and_rescale_grads(grad_denom)
 
         # clip grads
-        grad_norm = self._clip_grads_(self.flat_grads, self.args.clip_norm)
+        if self.args.clip_norm > 0:
+            grad_norm = torch.nn.utils.clip_grad_norm(self.model.parameters(), self.args.clip_norm)
+        else:
+            grad_norm = math.sqrt(sum([p.grad.data.norm()**2 for p in self.model.parameters()]))
 
         # take an optimization step
         self.optimizer.step()
 
-        return loss, grad_norm
+        # reset loss
+        self.loss = None
 
-    def _flatten_grads_(self, model):
-        num_params = sum(p.data.numel() for p in model.parameters())
-        flat_grads = next(model.parameters()).data.new(num_params)
-        offset = 0
-        for p in model.parameters():
-            grad = p.grad.data
-            numel, sz = grad.numel(), grad.size()
-            flat_grads[offset:offset+numel] = grad.view(-1)
-            grad.set_(flat_grads[offset:offset+numel])
-            grad.resize_(sz)  # preserve original shape
-            offset += numel
-        return flat_grads
+        return grad_norm, oom
 
-    def _clip_grads_(self, flat_grads, clipv):
-        norm = flat_grads.norm()
-        if clipv > 0 and norm > clipv:
-            coef = max(norm, 1e-6) / clipv
-            flat_grads.div_(coef)
-        return norm
+    def _all_reduce_and_rescale_grads(self, grad_denom, buffer_size=10485760):
+        """All-reduce and rescale gradients in chunks of the specified size."""
+        grads = [p.grad.data for p in self.model.parameters() if p.requires_grad]
+        buffer_t = grads[0].new(math.ceil(buffer_size / grads[0].element_size())).zero_()
+        buffer = []
 
-    def valid_step(self, samples, criterion):
+        def all_reduce_buffer():
+            # copy grads into buffer_t
+            offset = 0
+            for g in buffer:
+                numel = g.numel()
+                buffer_t[offset:offset+numel].copy_(g.view(-1))
+                offset += numel
+            # all-reduce and rescale
+            nccl.all_reduce(buffer_t[:offset])
+            buffer_t.div_(grad_denom)
+            # copy all-reduced buffer back into grads
+            offset = 0
+            for g in buffer:
+                numel = g.numel()
+                g.view(-1).copy_(buffer_t[offset:offset+numel])
+                offset += numel
+
+        filled = 0
+        for g in grads:
+            sz = g.numel() * g.element_size()
+            if sz > buffer_size:
+                # grad is bigger than buffer, all-reduce and rescale directly
+                nccl.all_reduce(g)
+                g.div_(grad_denom)
+            elif filled + sz > buffer_size:
+                # buffer is full, all-reduce and replace buffer with grad
+                all_reduce_buffer()
+                buffer = [g]
+                filled = sz
+            else:
+                # add grad to buffer
+                buffer.append(g)
+                filled += sz
+        if len(buffer) > 0:
+            all_reduce_buffer()
+
+    def valid_step(self, samples):
         """Do forward pass in parallel."""
         # scatter sample across GPUs
-        samples, data_events = self._scatter_samples(samples, volatile=True)
-        criterion.prepare(samples)
+        self._scatter_samples(samples, volatile=True)
 
         # forward pass
-        losses = [
-            self.call_async(rank, '_async_valid_step', sample=samples[rank],
-                            criterion=criterion, data_event=event)
-            for rank, event in enumerate(data_events)
-        ]
+        _sample_sizes, logging_outputs, ooms_fwd = Future.gen_tuple_list([
+            self.call_async(rank, '_async_forward', eval=True)
+            for rank in range(self.num_replicas)
+        ])
+        assert sum(ooms_fwd) == 0
 
-        # aggregate losses
-        loss = criterion.aggregate(Future.gen_list(losses))
+        # aggregate logging output
+        logging_output = self.criterion.__class__.aggregate_logging_outputs(logging_outputs)
 
-        return loss
-
-    def _async_valid_step(self, rank, device_id, sample, criterion, data_event):
-        if sample is None:
-            return 0
-        data_event.wait()
-
-        self.model.eval()
-        net_output = self.model(**sample['net_input'])
-        loss = criterion(net_output, sample)
-        return loss.data[0]
+        return logging_output
 
     def get_lr(self):
         """Get the current learning rate."""
@@ -239,22 +361,28 @@ class MultiprocessingTrainer(MultiprocessingEventLoop):
             self.lr_scheduler.step(val_loss, epoch)
         return self.optimizer.param_groups[0]['lr']
 
-    def _scatter_samples(self, samples, volatile=False):
+    def _scatter_samples(self, samples, volatile=False, replace_empty_samples=False):
         """Split and distribute a sample across GPUs."""
-        res = [utils.prepare_sample(sample, volatile=volatile,
-                                    cuda_device=device_id)
-               for sample, device_id in zip(samples, self.device_ids)]
+        if not replace_empty_samples:
+            # pad with None until its size is equal to the number of replicas
+            samples = samples + [None]*(self.num_replicas - len(samples))
+        else:
+            # pad by cycling through the given samples
+            samples = list(islice(cycle(samples), self.num_replicas))
 
-        # Pad with None until its size is equal to the number of replicas.
-        res = res + [None]*(self.num_replicas - len(samples))
+        Future.gen_list([
+            self.call_async(rank, '_async_prepare_sample', sample=samples[rank], volatile=volatile)
+            for rank in range(self.num_replicas)
+        ])
 
-        # Synchronize GPU devices after data is sent to prevent
-        # race conditions.
-        events = []
-        for d in self.device_ids:
-            with torch.cuda.device(d):
-                event = torch.cuda.Event(interprocess=True)
-                event.record()
-                events.append(event)
+    def _async_prepare_sample(self, rank, device_id, sample, volatile):
+        if sample is None:
+            self._sample = None
+        else:
+            if hasattr(torch.cuda, 'empty_cache'):
+                # clear the caching allocator if this is the largest sample we've seen
+                if sample['target'].size(0) > self._max_bsz_seen:
+                    self._max_bsz_seen = sample['target'].size(0)
+                    torch.cuda.empty_cache()
 
-        return res, events
+            self._sample = utils.make_variable(sample, volatile=volatile, cuda_device=device_id)

@@ -17,6 +17,7 @@ class Dictionary(object):
         self.symbols = []
         self.count = []
         self.indices = {}
+        # dictionary indexing starts at 1 for consistency with Lua
         self.add_symbol('<Lua heritage>')
         self.pad_index = self.add_symbol(pad)
         self.eos_index = self.add_symbol(eos)
@@ -38,13 +39,31 @@ class Dictionary(object):
             return self.indices[sym]
         return self.unk_index
 
-    def string(self, tensor):
-        if torch.is_tensor(tensor) and tensor.dim() == 2:
-            sentences = [self.string(line) for line in tensor]
-            return '\n'.join(sentences)
+    def string(self, tensor, bpe_symbol=None, escape_unk=False):
+        """Helper for converting a tensor of token indices to a string.
 
-        eos = self.eos()
-        return ' '.join([self[i] for i in tensor if i != eos])
+        Can optionally remove BPE symbols or escape <unk> words.
+        """
+        if torch.is_tensor(tensor) and tensor.dim() == 2:
+            return '\n'.join(self.string(t) for t in tensor)
+
+        def token_string(i):
+            if i == self.unk():
+                return self.unk_string(escape_unk)
+            else:
+                return self[i]
+
+        sent = ' '.join(token_string(i) for i in tensor if i != self.eos())
+        if bpe_symbol is not None:
+            sent = sent.replace(bpe_symbol, '')
+        return sent
+
+    def unk_string(self, escape=False):
+        """Return unknown string, optionally escaped as: <<unk>>"""
+        if escape:
+            return '<{}>'.format(self.unk_word)
+        else:
+            return self.unk_word
 
     def add_symbol(self, word, n=1):
         """Adds a word to the dictionary"""
@@ -91,8 +110,14 @@ class Dictionary(object):
         """
 
         if isinstance(f, str):
-            with open(f, 'r') as fd:
-                return Dictionary.load(fd)
+            try:
+                with open(f, 'r', encoding='utf-8') as fd:
+                    return Dictionary.load(fd)
+            except FileNotFoundError as fnfe:
+                raise fnfe
+            except:
+                raise Exception("Incorrect encoding detected in {}, please "
+                                "rebuild the dataset".format(f))
 
         d = Dictionary()
         for line in f.readlines():
@@ -107,7 +132,7 @@ class Dictionary(object):
     def save(self, f, threshold=3, nwords=-1):
         """Stores dictionary into a text file"""
         if isinstance(f, str):
-            with open(f, 'w') as fd:
+            with open(f, 'w', encoding='utf-8') as fd:
                 return self.save(fd, threshold, nwords)
         cnt = 0
         for i, t in enumerate(zip(self.symbols, self.count)):

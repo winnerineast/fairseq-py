@@ -13,11 +13,13 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 
 from fairseq import utils
+from fairseq.models import FairseqIncrementalDecoder
 
 
 class SequenceGenerator(object):
-    def __init__(self, models, dst_dict, beam_size=1, minlen=1, maxlen=200,
-                 stop_early=True, normalize_scores=True, len_penalty=1):
+    def __init__(self, models, beam_size=1, minlen=1, maxlen=None,
+                 stop_early=True, normalize_scores=True, len_penalty=1,
+                 unk_penalty=0, retain_dropout=False):
         """Generates translations of a given source sentence.
 
         Args:
@@ -29,26 +31,29 @@ class SequenceGenerator(object):
             normalize_scores: Normalize scores by the length of the output.
         """
         self.models = models
-        self.dict = dst_dict
-        self.pad = dst_dict.pad()
-        self.eos = dst_dict.eos()
-        self.vocab_size = len(dst_dict)
+        self.pad = models[0].dst_dict.pad()
+        self.unk = models[0].dst_dict.unk()
+        self.eos = models[0].dst_dict.eos()
+        assert all(m.dst_dict.pad() == self.pad for m in self.models[1:])
+        assert all(m.dst_dict.unk() == self.unk for m in self.models[1:])
+        assert all(m.dst_dict.eos() == self.eos for m in self.models[1:])
+        self.vocab_size = len(models[0].dst_dict)
         self.beam_size = beam_size
         self.minlen = minlen
-        self.maxlen = maxlen
-        self.positions = torch.LongTensor(range(self.pad + 1, self.pad + maxlen + 2))
-        self.decoder_context = models[0].decoder.context_size()
+        max_decoder_len = min([m.max_decoder_positions() for m in self.models])
+        self.maxlen = max_decoder_len if maxlen is None else min(maxlen, max_decoder_len)
         self.stop_early = stop_early
         self.normalize_scores = normalize_scores
         self.len_penalty = len_penalty
+        self.unk_penalty = unk_penalty
+        self.retain_dropout = retain_dropout
 
     def cuda(self):
         for model in self.models:
             model.cuda()
-        self.positions = self.positions.cuda()
         return self
 
-    def generate_batched_itr(self, data_itr, maxlen_a=0, maxlen_b=200,
+    def generate_batched_itr(self, data_itr, beam_size=None, maxlen_a=0.0, maxlen_b=None,
                              cuda_device=None, timer=None):
         """Iterate over a batched dataset and yield individual translations.
 
@@ -58,46 +63,51 @@ class SequenceGenerator(object):
             cuda_device: GPU on which to do generation.
             timer: StopwatchMeter for timing generations.
         """
-
-        def lstrip_pad(tensor):
-            return tensor[tensor.eq(self.pad).sum():]
+        if maxlen_b is None:
+            maxlen_b = self.maxlen
 
         for sample in data_itr:
-            s = utils.prepare_sample(sample, volatile=True, cuda_device=cuda_device)
+            s = utils.make_variable(sample, volatile=True, cuda_device=cuda_device)
             input = s['net_input']
             srclen = input['src_tokens'].size(1)
             if timer is not None:
                 timer.start()
-            hypos = self.generate(input['src_tokens'], input['src_positions'],
-                                  maxlen=(maxlen_a*srclen + maxlen_b))
+            with utils.maybe_no_grad():
+                hypos = self.generate(input['src_tokens'], beam_size=beam_size,
+                                      maxlen=int(maxlen_a*srclen + maxlen_b))
             if timer is not None:
                 timer.stop(s['ntokens'])
-            for i, id in enumerate(s['id']):
+            for i, id in enumerate(s['id'].data):
                 src = input['src_tokens'].data[i, :]
-                # remove padding from ref, which appears at the beginning
-                ref = lstrip_pad(s['target'].data[i, :])
+                # remove padding from ref
+                ref = utils.strip_pad(s['target'].data[i, :], self.pad)
                 yield id, src, ref, hypos[i]
 
-    def generate(self, src_tokens, src_positions, beam_size=None, maxlen=None):
+    def generate(self, src_tokens, beam_size=None, maxlen=None):
         """Generate a batch of translations."""
         with ExitStack() as stack:
             for model in self.models:
-                stack.enter_context(model.decoder.incremental_inference())
-            return self._generate(src_tokens, src_positions, beam_size, maxlen)
+                if isinstance(model.decoder, FairseqIncrementalDecoder):
+                    stack.enter_context(model.decoder.incremental_inference())
+            return self._generate(src_tokens, beam_size, maxlen)
 
-    def _generate(self, src_tokens, src_positions, beam_size=None, maxlen=None):
-        bsz = src_tokens.size(0)
-        beam_size = beam_size if beam_size is not None else self.beam_size
+    def _generate(self, src_tokens, beam_size=None, maxlen=None):
+        bsz, srclen = src_tokens.size()
         maxlen = min(maxlen, self.maxlen) if maxlen is not None else self.maxlen
+
+        # the max beam size is the dictionary size - 1, since we never select pad
+        beam_size = beam_size if beam_size is not None else self.beam_size
+        beam_size = min(beam_size, self.vocab_size - 1)
 
         encoder_outs = []
         for model in self.models:
-            model.eval()
-            model.decoder.clear_incremental_state()  # start a fresh sequence
+            if not self.retain_dropout:
+                model.eval()
+            if isinstance(model.decoder, FairseqIncrementalDecoder):
+                model.decoder.set_beam_size(beam_size)
 
-            # compute the encoder output and expand to beam size
-            encoder_out = model.encoder(src_tokens, src_positions)
-            encoder_out = self._expand_encoder_out(encoder_out, beam_size)
+            # compute the encoder output for each beam
+            encoder_out = model.encoder(src_tokens.repeat(1, beam_size).view(-1, srclen))
             encoder_outs.append(encoder_out)
 
         # initialize buffers
@@ -105,8 +115,8 @@ class SequenceGenerator(object):
         tokens = src_tokens.data.new(bsz * beam_size, maxlen + 2).fill_(self.pad)
         tokens_buf = tokens.clone()
         tokens[:, 0] = self.eos
-        align = src_tokens.data.new(bsz * beam_size, maxlen + 2).fill_(-1)
-        align_buf = align.clone()
+        attn = scores.new(bsz * beam_size, src_tokens.size(1), maxlen + 2)
+        attn_buf = attn.clone()
 
         # list of completed sentences
         finalized = [[] for i in range(bsz)]
@@ -123,7 +133,7 @@ class SequenceGenerator(object):
 
         # helper function for allocating buffers on the fly
         buffers = {}
-        def buffer(name, type_of=tokens):
+        def buffer(name, type_of=tokens):  # noqa
             if name not in buffers:
                 buffers[name] = type_of.new()
             return buffers[name]
@@ -172,12 +182,14 @@ class SequenceGenerator(object):
                 sents_seen.add(sent)
 
                 def get_hypo():
-                    hypo = tokens[idx, 1:step+2].clone()
+                    hypo = tokens[idx, 1:step+2].clone()  # skip the first index, which is EOS
                     hypo[step] = self.eos
-                    alignment = align[idx, 1:step+2].clone()
+                    attention = attn[idx, :, 1:step+2].clone()
+                    _, alignment = attention.max(dim=0)
                     return {
                         'tokens': hypo,
                         'score': score,
+                        'attention': attention,
                         'alignment': alignment,
                     }
 
@@ -209,7 +221,8 @@ class SequenceGenerator(object):
             # reorder decoder internal states based on the prev choice of beams
             if reorder_state is not None:
                 for model in self.models:
-                    model.decoder.reorder_incremental_state(reorder_state)
+                    if isinstance(model.decoder, FairseqIncrementalDecoder):
+                        model.decoder.reorder_incremental_state(reorder_state)
 
             probs, avg_attn_scores = self._decode(tokens[:, :step+1], encoder_outs)
             if step == 0:
@@ -219,17 +232,20 @@ class SequenceGenerator(object):
             else:
                 # make probs contain cumulative scores for each hypothesis
                 probs.add_(scores.view(-1, 1))
+            probs[:, self.pad] = -math.inf  # never select pad
+            probs[:, self.unk] -= self.unk_penalty  # apply unk penalty
 
-            # record alignment to source tokens, based on attention
-            _ignore_scores = buffer('_ignore_scores', type_of=scores)
-            avg_attn_scores.topk(1, out=(_ignore_scores, align[:, step+1].unsqueeze(1)))
+            # Record attention scores
+            attn[:, :, step+1].copy_(avg_attn_scores)
 
             # take the best 2 x beam_size predictions. We'll choose the first
             # beam_size of these which don't predict eos to continue with.
             cand_scores = buffer('cand_scores', type_of=scores)
             cand_indices = buffer('cand_indices')
             cand_beams = buffer('cand_beams')
-            probs.view(bsz, -1).topk(cand_size, out=(cand_scores, cand_indices))
+            probs.view(bsz, -1).topk(
+                min(cand_size, probs.view(bsz, -1).size(1) - 1),  # -1 so we never select pad
+                out=(cand_scores, cand_indices))
             torch.div(cand_indices, self.vocab_size, out=cand_beams)
             cand_indices.fmod_(self.vocab_size)
 
@@ -242,10 +258,11 @@ class SequenceGenerator(object):
             eos_mask = cand_indices.eq(self.eos)
             if step >= self.minlen:
                 eos_bbsz_idx = buffer('eos_bbsz_idx')
-                cand_bbsz_idx.masked_select(eos_mask, out=eos_bbsz_idx)
+                # only consider eos when it's among the top beam_size indices
+                cand_bbsz_idx[:, :beam_size].masked_select(eos_mask[:, :beam_size], out=eos_bbsz_idx)
                 if eos_bbsz_idx.numel() > 0:
                     eos_scores = buffer('eos_scores', type_of=scores)
-                    cand_scores.masked_select(eos_mask, out=eos_scores)
+                    cand_scores[:, :beam_size].masked_select(eos_mask[:, :beam_size], out=eos_scores)
                     num_remaining_sent -= finalize_hypos(step, eos_bbsz_idx, eos_scores)
 
             assert num_remaining_sent >= 0
@@ -256,7 +273,7 @@ class SequenceGenerator(object):
             # and values < cand_size indicate candidate active hypos.
             # After, the min values per row are the top candidate active hypos
             active_mask = buffer('active_mask')
-            torch.add((eos_mask*cand_size).type_as(cand_offsets), cand_offsets,
+            torch.add(eos_mask.type_as(cand_offsets)*cand_size, cand_offsets[:eos_mask.size(1)],
                       out=active_mask)
 
             # get the top beam_size active hypotheses, which are just the hypos
@@ -284,17 +301,17 @@ class SequenceGenerator(object):
             cand_indices.gather(1, active_hypos,
                                 out=tokens_buf.view(bsz, beam_size, -1)[:, :, step+1])
 
-            # copy attention/alignment for active hypotheses
-            torch.index_select(align[:, :step+2], dim=0, index=active_bbsz_idx,
-                               out=align_buf[:, :step+2])
+            # copy attention for active hypotheses
+            torch.index_select(attn[:, :, :step+2], dim=0, index=active_bbsz_idx,
+                               out=attn_buf[:, :, :step+2])
 
             # swap buffers
             old_tokens = tokens
             tokens = tokens_buf
             tokens_buf = old_tokens
-            old_align = align
-            align = align_buf
-            align_buf = old_align
+            old_attn = attn
+            attn = attn_buf
+            attn_buf = old_attn
 
             # reorder incremental state in decoder
             reorder_state = active_bbsz_idx
@@ -306,40 +323,28 @@ class SequenceGenerator(object):
         return finalized
 
     def _decode(self, tokens, encoder_outs):
-        length = tokens.size(1)
-
-        # repeat the first length positions to fill batch
-        positions = self.positions[:length].view(1, length)
-
-        # wrap in Variables
-        tokens = Variable(tokens, volatile=True)
-        positions = Variable(positions, volatile=True)
+        # wrap in Variable
+        tokens = utils.volatile_variable(tokens)
 
         avg_probs = None
         avg_attn = None
         for model, encoder_out in zip(self.models, encoder_outs):
-            decoder_out, attn = model.decoder(tokens, positions, encoder_out)
-            probs = F.softmax(decoder_out[:, -1, :]).data
-            attn = attn[:, -1, :].data
-            if avg_probs is None or avg_attn is None:
+            with utils.maybe_no_grad():
+                decoder_out, attn = model.decoder(tokens, encoder_out)
+            probs = model.get_normalized_probs(decoder_out[:, -1, :], log_probs=False).data
+            if avg_probs is None:
                 avg_probs = probs
-                avg_attn = attn
             else:
                 avg_probs.add_(probs)
-                avg_attn.add_(attn)
+            if attn is not None:
+                attn = attn[:, -1, :].data
+                if avg_attn is None:
+                    avg_attn = attn
+                else:
+                    avg_attn.add_(attn)
         avg_probs.div_(len(self.models))
         avg_probs.log_()
-        avg_attn.div_(len(self.models))
+        if avg_attn is not None:
+            avg_attn.div_(len(self.models))
 
         return avg_probs, avg_attn
-
-    def _expand_encoder_out(self, encoder_out, beam_size):
-        res = []
-        for tensor in encoder_out:
-            res.append(
-                # repeat beam_size times along second dimension
-                tensor.repeat(1, beam_size, *[1 for i in range(tensor.dim()-2)]) \
-                # then collapse into [bsz*beam, ...original dims...]
-                .view(-1, *tensor.size()[1:])
-            )
-        return tuple(res)

@@ -7,7 +7,6 @@
 #
 
 from .cross_entropy import CrossEntropyCriterion
-from .fairseq_criterion import FairseqCriterion
 from .label_smoothed_cross_entropy import LabelSmoothedCrossEntropyCriterion
 
 __all__ = [

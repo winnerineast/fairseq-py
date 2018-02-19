@@ -24,28 +24,13 @@ If you use the code in your paper, then please cite it as:
 * Python version 3.6
 * A [PyTorch installation](http://pytorch.org/)
 
-Currently fairseq-py requires PyTorch from the GitHub repository. There are multiple ways of installing it.
-We suggest using [Miniconda3](https://conda.io/miniconda.html) and the following instructions.
+Currently fairseq-py requires PyTorch version >= 0.3.0.
+Please follow the instructions here: https://github.com/pytorch/pytorch#installation.
 
-* Install Miniconda3 from https://conda.io/miniconda.html; create and activate a Python 3 environment.
+If you use Docker make sure to increase the shared memory size either with `--ipc=host` or `--shm-size` as command line
+options to `nvidia-docker run`.
 
-* Install PyTorch:
-```
-conda install gcc numpy cudnn nccl
-conda install magma-cuda80 -c soumith
-pip install cmake
-pip install cffi
-
-git clone https://github.com/pytorch/pytorch.git
-cd pytorch
-git reset --hard a03e5cb40938b6b3f3e6dbddf9cff8afdff72d1b
-git submodule update --init
-pip install -r requirements.txt
-
-NO_DISTRIBUTED=1 python setup.py install
-```
-
-* Install fairseq-py by cloning the GitHub repository and running:
+After PyTorch is installed, you can install fairseq-py with:
 ```
 pip install -r requirements.txt
 python setup.py build
@@ -58,13 +43,13 @@ The following command-line tools are available:
 * `python preprocess.py`: Data pre-processing: build vocabularies and binarize training data
 * `python train.py`: Train a new model on one or multiple GPUs
 * `python generate.py`: Translate pre-processed data with a trained model
-* `python generate.py -i`: Translate raw text with a trained model
+* `python interactive.py`: Translate raw text with a trained model
 * `python score.py`: BLEU scoring of generated translations against reference translations
 
 ## Evaluating Pre-trained Models
 First, download a pre-trained model along with its vocabularies:
 ```
-$ curl https://s3.amazonaws.com/fairseq-py/models/wmt14.en-fr.fconv-py.tar.bz2 | tar xvjf -
+$ curl https://s3.amazonaws.com/fairseq-py/models/wmt14.v2.en-fr.fconv-py.tar.bz2 | tar xvjf -
 ```
 
 This model uses a [Byte Pair Encoding (BPE) vocabulary](https://arxiv.org/abs/1508.07909), so we'll have to apply the encoding to the source text before it can be translated.
@@ -72,22 +57,21 @@ This can be done with the [apply_bpe.py](https://github.com/rsennrich/subword-nm
 `@@` is used as a continuation marker and the original text can be easily recovered with e.g. `sed s/@@ //g` or by passing the `--remove-bpe` flag to `generate.py`.
 Prior to BPE, input text needs to be tokenized using `tokenizer.perl` from [mosesdecoder](https://github.com/moses-smt/mosesdecoder).
 
-Let's use `python generate.py -i` to generate translations.
+Let's use `python interactive.py` to generate translations interactively.
 Here, we use a beam size of 5:
 ```
 $ MODEL_DIR=wmt14.en-fr.fconv-py
-$ python generate.py -i \
+$ python interactive.py \
  --path $MODEL_DIR/model.pt $MODEL_DIR \
  --beam 5
+| loading model(s) from wmt14.en-fr.fconv-py/model.pt
 | [en] dictionary: 44206 types
 | [fr] dictionary: 44463 types
-| model fconv_wmt_en_fr
-| loaded checkpoint /private/home/edunov/wmt14.en-fr.fconv-py/model.pt (epoch 37)
+| Type the input sentence and press return:
 > Why is it rare to discover new marine mam@@ mal species ?
-S       Why is it rare to discover new marine mam@@ mal species ?
 O       Why is it rare to discover new marine mam@@ mal species ?
-H       -0.08662842959165573    Pourquoi est-il rare de découvrir de nouvelles espèces de mammifères marins ?
-A       0 1 3 3 5 6 6 10 8 8 8 11 12
+H       -0.06429661810398102    Pourquoi est-il rare de découvrir de nouvelles espèces de mammifères marins ?
+A       0 1 3 3 5 6 6 8 8 8 7 11 12
 ```
 
 This generation script produces four types of outputs: a line prefixed with *S* shows the supplied source sentence after applying the vocabulary; *O* is a copy of the original source sentence; *H* is the hypothesis along with an average log-likelihood; and *A* is the attention maxima for each word in the hypothesis, including the end-of-sentence marker which is omitted from the text.
@@ -108,7 +92,7 @@ $ cd ..
 $ TEXT=data/iwslt14.tokenized.de-en
 $ python preprocess.py --source-lang de --target-lang en \
   --trainpref $TEXT/train --validpref $TEXT/valid --testpref $TEXT/test \
-  --thresholdtgt 3 --thresholdsrc 3 --destdir data-bin/iwslt14.tokenized.de-en
+  --destdir data-bin/iwslt14.tokenized.de-en
 ```
 This will write binarized data that can be used for model training to `data-bin/iwslt14.tokenized.de-en`.
 
@@ -129,7 +113,7 @@ Also note that the batch size is specified in terms of the maximum number of tok
 You may need to use a smaller value depending on the available GPU memory on your system.
 
 ### Generation
-Once your model is trained, you can generate translations using `python generate.py` **(for binarized data)** or `python generate.py -i` **(for raw text)**:
+Once your model is trained, you can generate translations using `python generate.py` **(for binarized data)** or `python interactive.py` **(for raw text)**:
 ```
 $ python generate.py data-bin/iwslt14.tokenized.de-en \
   --path checkpoints/fconv/checkpoint_best.pt \
@@ -151,30 +135,30 @@ BPE continuation markers can be removed with the `--remove-bpe` flag.
 
 We provide the following pre-trained fully convolutional sequence-to-sequence models:
 
-* [wmt14.en-fr.fconv-py.tar.bz2](https://s3.amazonaws.com/fairseq-py/models/wmt14.en-fr.fconv-py.tar.bz2): Pre-trained model for [WMT14 English-French](http://statmt.org/wmt14/translation-task.html#Download) including vocabularies
-* [wmt14.en-de.fconv-py.tar.bz2](https://s3.amazonaws.com/fairseq-py/models/wmt14.en-de.fconv-py.tar.bz2): Pre-trained model for [WMT14 English-German](https://nlp.stanford.edu/projects/nmt) including vocabularies
+* [wmt14.en-fr.fconv-py.tar.bz2](https://s3.amazonaws.com/fairseq-py/models/wmt14.v2.en-fr.fconv-py.tar.bz2): Pre-trained model for [WMT14 English-French](http://statmt.org/wmt14/translation-task.html#Download) including vocabularies
+* [wmt14.en-de.fconv-py.tar.bz2](https://s3.amazonaws.com/fairseq-py/models/wmt14.v2.en-de.fconv-py.tar.bz2): Pre-trained model for [WMT14 English-German](https://nlp.stanford.edu/projects/nmt) including vocabularies
 
 In addition, we provide pre-processed and binarized test sets for the models above:
-* [wmt14.en-fr.newstest2014.tar.bz2](https://s3.amazonaws.com/fairseq-py/data/wmt14.en-fr.newstest2014.tar.bz2): newstest2014 test set for WMT14 English-French
-* [wmt14.en-fr.ntst1213.tar.bz2](https://s3.amazonaws.com/fairseq-py/data/wmt14.en-fr.ntst1213.tar.bz2): newstest2012 and newstest2013 test sets for WMT14 English-French
-* [wmt14.en-de.newstest2014.tar.bz2](https://s3.amazonaws.com/fairseq-py/data/wmt14.en-de.newstest2014.tar.bz2): newstest2014 test set for WMT14 English-German
+* [wmt14.en-fr.newstest2014.tar.bz2](https://s3.amazonaws.com/fairseq-py/data/wmt14.v2.en-fr.newstest2014.tar.bz2): newstest2014 test set for WMT14 English-French
+* [wmt14.en-fr.ntst1213.tar.bz2](https://s3.amazonaws.com/fairseq-py/data/wmt14.v2.en-fr.ntst1213.tar.bz2): newstest2012 and newstest2013 test sets for WMT14 English-French
+* [wmt14.en-de.newstest2014.tar.bz2](https://s3.amazonaws.com/fairseq-py/data/wmt14.v2.en-de.newstest2014.tar.bz2): newstest2014 test set for WMT14 English-German
 
 Generation with the binarized test sets can be run in batch mode as follows, e.g. for English-French on a GTX-1080ti:
 ```
-$ curl https://s3.amazonaws.com/fairseq-py/models/wmt14.en-fr.fconv-py.tar.bz2 | tar xvjf - -C data-bin
-$ curl https://s3.amazonaws.com/fairseq-py/data/wmt14.en-fr.newstest2014.tar.bz2 | tar xvjf - -C data-bin
+$ curl https://s3.amazonaws.com/fairseq-py/models/wmt14.v2.en-fr.fconv-py.tar.bz2 | tar xvjf - -C data-bin
+$ curl https://s3.amazonaws.com/fairseq-py/data/wmt14.v2.en-fr.newstest2014.tar.bz2 | tar xvjf - -C data-bin
 $ python generate.py data-bin/wmt14.en-fr.newstest2014  \
   --path data-bin/wmt14.en-fr.fconv-py/model.pt \
   --beam 5 --batch-size 128 --remove-bpe | tee /tmp/gen.out
 ...
-| Translated 3003 sentences (95451 tokens) in 81.3s (1174.33 tokens/s)
-| Generate test with beam=5: BLEU4 = 40.23, 67.5/46.4/33.8/25.0 (BP=0.997, ratio=1.003, syslen=80963, reflen=81194)
+| Translated 3003 sentences (96311 tokens) in 166.0s (580.04 tokens/s)
+| Generate test with beam=5: BLEU4 = 40.83, 67.5/46.9/34.4/25.5 (BP=1.000, ratio=1.006, syslen=83262, reflen=82787)
 
 # Scoring with score.py:
 $ grep ^H /tmp/gen.out | cut -f3- > /tmp/gen.out.sys
 $ grep ^T /tmp/gen.out | cut -f2- > /tmp/gen.out.ref
 $ python score.py --sys /tmp/gen.out.sys --ref /tmp/gen.out.ref
-BLEU4 = 40.23, 67.5/46.4/33.8/25.0 (BP=0.997, ratio=1.003, syslen=80963, reflen=81194)
+BLEU4 = 40.83, 67.5/46.9/34.4/25.5 (BP=1.000, ratio=1.006, syslen=83262, reflen=82787)
 ```
 
 # Join the fairseq community

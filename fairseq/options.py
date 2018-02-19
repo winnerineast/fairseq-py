@@ -9,6 +9,7 @@
 import argparse
 
 from fairseq import models
+from fairseq.multiprocessing_trainer import MultiprocessingTrainer
 
 
 def get_parser(desc):
@@ -17,6 +18,8 @@ def get_parser(desc):
     parser.add_argument('--no-progress-bar', action='store_true', help='disable progress bar')
     parser.add_argument('--log-interval', type=int, default=1000, metavar='N',
                         help='log progress every N updates (when progress bar is disabled)')
+    parser.add_argument('--log-format', default=None, help='log format to use',
+                        choices=['json', 'none', 'simple', 'tqdm'])
     parser.add_argument('--seed', default=1, type=int, metavar='N',
                         help='pseudo random number generator seed')
     return parser
@@ -32,15 +35,22 @@ def add_dataset_args(parser):
                        help='target language')
     group.add_argument('-j', '--workers', default=1, type=int, metavar='N',
                        help='number of data loading workers (default: 1)')
-    group.add_argument('--max-positions', default=1024, type=int, metavar='N',
-                       help='max number of tokens in the sequence')
+    group.add_argument('--max-source-positions', default=1024, type=int, metavar='N',
+                       help='max number of tokens in the source sequence')
+    group.add_argument('--max-target-positions', default=1024, type=int, metavar='N',
+                       help='max number of tokens in the target sequence')
+    group.add_argument('--skip-invalid-size-inputs-valid-test', action='store_true',
+                       help='Ignore too long or too short lines in valid and test set')
     return group
 
 
 def add_optimization_args(parser):
     group = parser.add_argument_group('Optimization')
-    group.add_argument('--lr', '--learning-rate', default=0.25, type=float, metavar='LR',
-                       help='initial learning rate')
+    group.add_argument('--optimizer', default='nag', metavar='OPT',
+                       choices=MultiprocessingTrainer.OPTIMIZERS,
+                       help='optimizer ({})'.format(', '.join(MultiprocessingTrainer.OPTIMIZERS)))
+    group.add_argument('--lr', '--learning-rate', default='0.25', metavar='LR1,LR2,...,LRn',
+                       help='learning rate for the first n epochs with all epochs >n using LRn')
     group.add_argument('--min-lr', metavar='LR', default=1e-5, type=float,
                        help='minimum learning rate')
     group.add_argument('--force-anneal', '--fa', default=0, type=int, metavar='N',
@@ -51,14 +61,21 @@ def add_optimization_args(parser):
                        help='learning rate shrink factor for annealing, lr_new = (lr * lrshrink)')
     group.add_argument('--momentum', default=0.99, type=float, metavar='M',
                        help='momentum factor')
+    group.add_argument('--adam-betas', default='(0.9, 0.999)', metavar='B',
+                       help='betas for Adam optimizer')
     group.add_argument('--clip-norm', default=25, type=float, metavar='NORM',
                        help='clip threshold of gradients')
     group.add_argument('--weight-decay', '--wd', default=0.0, type=float, metavar='WD',
                        help='weight decay')
     group.add_argument('--sample-without-replacement', default=0, type=int, metavar='N',
                        help='If bigger than 0, use that number of mini-batches for each epoch,'
-                            ' where each sample is drawn randomly with replacement from the'
+                            ' where each sample is drawn randomly without replacement from the'
                             ' dataset')
+    group.add_argument('--curriculum', default=0, type=int, metavar='N',
+                       help='sort batches by source length for first N epochs')
+    group.add_argument('--sentence-avg', action='store_true',
+                       help='normalize gradients by the number of sentences in a batch'
+                            ' (default is to normalize by number of tokens)')
     return group
 
 
@@ -83,13 +100,13 @@ def add_generation_args(parser):
                        help='beam size')
     group.add_argument('--nbest', default=1, type=int, metavar='N',
                        help='number of hypotheses to output')
-    group.add_argument('--max-len-a', default=0, type=int, metavar='N',
-                       help=('generate sequence of maximum length ax + b, '
+    group.add_argument('--max-len-a', default=0, type=float, metavar='N',
+                       help=('generate sequences of maximum length ax + b, '
                              'where x is the source length'))
     group.add_argument('--max-len-b', default=200, type=int, metavar='N',
-                       help=('generate sequence of maximum length ax + b, '
+                       help=('generate sequences of maximum length ax + b, '
                              'where x is the source length'))
-    group.add_argument('--remove-bpe', action='store_true',
+    group.add_argument('--remove-bpe', nargs='?', const='@@ ', default=None,
                        help='remove BPE tokens before scoring')
     group.add_argument('--no-early-stop', action='store_true',
                        help=('continue searching even after finalizing k=beam '
@@ -102,8 +119,12 @@ def add_generation_args(parser):
                        help='don\'t use BeamableMM in attention layers')
     group.add_argument('--lenpen', default=1, type=float,
                        help='length penalty: <1.0 favors shorter, >1.0 favors longer sentences')
-    group.add_argument('--unk-replace-dict', default='', type=str,
-                       help='performs unk word replacement')
+    group.add_argument('--unkpen', default=0, type=float,
+                       help='unknown word penalty: <0 produces more unks, >0 produces fewer')
+    group.add_argument('--replace-unk', nargs='?', const=True, default=None,
+                       help='perform unknown replacement (optionally with alignment dictionary)')
+    group.add_argument('--quiet', action='store_true',
+                       help='Only print final scores')
 
     return group
 
@@ -137,9 +158,23 @@ def add_model_args(parser):
     group.add_argument('--decoder-attention', type=str, metavar='EXPR',
                        help='decoder attention [True, ...]')
 
+    # Granular dropout settings for models that support them (e.g., LSTM):
+    group.add_argument('--encoder-dropout-in', type=float, metavar='D',
+                       help='dropout probability for encoder input embedding')
+    group.add_argument('--encoder-dropout-out', type=float, metavar='D',
+                       help='dropout probability for encoder output')
+    group.add_argument('--decoder-dropout-in', type=float, metavar='D',
+                       help='dropout probability for decoder input embedding')
+    group.add_argument('--decoder-dropout-out', type=float, metavar='D',
+                       help='dropout probability for decoder output')
+
     # These arguments have default values independent of the model:
     group.add_argument('--dropout', default=0.1, type=float, metavar='D',
                        help='dropout probability')
     group.add_argument('--label-smoothing', default=0, type=float, metavar='D',
                        help='epsilon for label smoothing, 0 means no label smoothing')
+
+    group.add_argument('--share-input-output-embed', action='store_true',
+                       help="Share input and output embeddings, "
+                            "requires --decoder-out-embed-dim and --decoder-embed-dim be equal ")
     return group
