@@ -4,7 +4,6 @@
 # This source code is licensed under the license found in the LICENSE file in
 # the root directory of this source tree. An additional grant of patent rights
 # can be found in the PATENTS file in the same directory.
-#
 
 import ctypes
 import math
@@ -58,9 +57,10 @@ class Scorer(object):
             raise TypeError('pred must be a torch.IntTensor(got {})'
                             .format(type(pred)))
 
-        assert self.unk > 0, 'unknown token index must be >0'
+        # don't match unknown words
         rref = ref.clone()
-        rref.apply_(lambda x: x if x != self.unk else -x)
+        assert not rref.lt(0).any()
+        rref[rref.eq(self.unk)] = -999
 
         rref = rref.contiguous().view(-1)
         pred = pred.contiguous().view(-1)

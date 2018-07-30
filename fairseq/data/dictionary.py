@@ -4,9 +4,10 @@
 # This source code is licensed under the license found in the LICENSE file in
 # the root directory of this source tree. An additional grant of patent rights
 # can be found in the PATENTS file in the same directory.
-#
 
-import math
+from collections import Counter
+import os
+
 import torch
 
 
@@ -23,6 +24,9 @@ class Dictionary(object):
         self.eos_index = self.add_symbol(eos)
         self.unk_index = self.add_symbol(unk)
         self.nspecial = len(self.symbols)
+
+    def __eq__(self, other):
+        return self.indices == other.indices
 
     def __getitem__(self, idx):
         if idx < len(self.symbols):
@@ -55,7 +59,7 @@ class Dictionary(object):
 
         sent = ' '.join(token_string(i) for i in tensor if i != self.eos())
         if bpe_symbol is not None:
-            sent = sent.replace(bpe_symbol, '')
+            sent = (sent + ' ').replace(bpe_symbol, '').rstrip()
         return sent
 
     def unk_string(self, escape=False):
@@ -78,13 +82,63 @@ class Dictionary(object):
             self.count.append(n)
             return idx
 
-    def finalize(self):
-        """Sort symbols by frequency in descending order, ignoring special ones."""
-        self.count, self.symbols = zip(
-            *sorted(zip(self.count, self.symbols),
-                    key=(lambda x: math.inf if self.indices[x[1]] < self.nspecial else x[0]),
-                    reverse=True)
-        )
+    def update(self, new_dict):
+        """Updates counts from new dictionary."""
+        for word in new_dict.symbols:
+            idx2 = new_dict.indices[word]
+            if word in self.indices:
+                idx = self.indices[word]
+                self.count[idx] = self.count[idx] + new_dict.count[idx2]
+            else:
+                idx = len(self.symbols)
+                self.indices[word] = idx
+                self.symbols.append(word)
+                self.count.append(new_dict.count[idx2])
+
+    def finalize(self, threshold=-1, nwords=-1, padding_factor=8):
+        """Sort symbols by frequency in descending order, ignoring special ones.
+
+        Args:
+            - threshold defines the minimum word count
+            - nwords defines the total number of words in the final dictionary,
+                including special symbols
+            - padding_factor can be used to pad the dictionary size to be a
+                multiple of 8, which is important on some hardware (e.g., Nvidia
+                Tensor Cores).
+        """
+        if nwords <= 0:
+            nwords = len(self)
+
+        new_indices = dict(zip(self.symbols[:self.nspecial], range(self.nspecial)))
+        new_symbols = self.symbols[:self.nspecial]
+        new_count = self.count[:self.nspecial]
+
+        c = Counter(dict(zip(self.symbols[self.nspecial:], self.count[self.nspecial:])))
+        for symbol, count in c.most_common(nwords - self.nspecial):
+            if count >= threshold:
+                new_indices[symbol] = len(new_symbols)
+                new_symbols.append(symbol)
+                new_count.append(count)
+            else:
+                break
+
+        threshold_nwords = len(new_symbols)
+        if padding_factor > 1:
+            i = 0
+            while threshold_nwords % padding_factor != 0:
+                symbol = 'madeupword{:04d}'.format(i)
+                new_indices[symbol] = len(new_symbols)
+                new_symbols.append(symbol)
+                new_count.append(0)
+                i += 1
+                threshold_nwords += 1
+
+        assert len(new_symbols) % padding_factor == 0
+        assert len(new_symbols) == len(new_indices)
+
+        self.count = list(new_count)
+        self.symbols = list(new_symbols)
+        self.indices = new_indices
 
     def pad(self):
         """Helper to get index of pad symbol"""
@@ -98,8 +152,8 @@ class Dictionary(object):
         """Helper to get index of unk symbol"""
         return self.unk_index
 
-    @staticmethod
-    def load(f):
+    @classmethod
+    def load(cls, f, ignore_utf_errors=False):
         """Loads the dictionary from a text file with the format:
 
         ```
@@ -108,18 +162,21 @@ class Dictionary(object):
         ...
         ```
         """
-
         if isinstance(f, str):
             try:
-                with open(f, 'r', encoding='utf-8') as fd:
-                    return Dictionary.load(fd)
+                if not ignore_utf_errors:
+                    with open(f, 'r', encoding='utf-8') as fd:
+                        return cls.load(fd)
+                else:
+                    with open(f, 'r', encoding='utf-8', errors='ignore') as fd:
+                        return cls.load(fd)
             except FileNotFoundError as fnfe:
                 raise fnfe
-            except:
+            except Exception:
                 raise Exception("Incorrect encoding detected in {}, please "
                                 "rebuild the dataset".format(f))
 
-        d = Dictionary()
+        d = cls()
         for line in f.readlines():
             idx = line.rfind(' ')
             word = line[:idx]
@@ -129,14 +186,16 @@ class Dictionary(object):
             d.count.append(count)
         return d
 
-    def save(self, f, threshold=3, nwords=-1):
+    def save(self, f):
         """Stores dictionary into a text file"""
         if isinstance(f, str):
+            os.makedirs(os.path.dirname(f), exist_ok=True)
             with open(f, 'w', encoding='utf-8') as fd:
-                return self.save(fd, threshold, nwords)
-        cnt = 0
-        for i, t in enumerate(zip(self.symbols, self.count)):
-            if i >= self.nspecial and t[1] >= threshold \
-                    and (nwords < 0 or cnt < nwords):
-                print('{} {}'.format(t[0], t[1]), file=f)
-                cnt += 1
+                return self.save(fd)
+        for symbol, count in zip(self.symbols[self.nspecial:], self.count[self.nspecial:]):
+            print('{} {}'.format(symbol, count), file=f)
+
+    def dummy_sentence(self, length):
+        t = torch.Tensor(length).uniform_(self.nspecial + 1, len(self)).long()
+        t[-1] = self.eos()
+        return t
