@@ -1,19 +1,18 @@
-# Copyright (c) 2017-present, Facebook, Inc.
-# All rights reserved.
+# Copyright (c) Facebook, Inc. and its affiliates.
 #
-# This source code is licensed under the license found in the LICENSE file in
-# the root directory of this source tree. An additional grant of patent rights
-# can be found in the PATENTS file in the same directory.
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
 
-import torch.optim
+import math
+
+import torch
 
 
 class FairseqOptimizer(object):
 
-    def __init__(self, args, params):
+    def __init__(self, args):
         super().__init__()
         self.args = args
-        self.params = params
 
     @staticmethod
     def add_args(parser):
@@ -39,6 +38,16 @@ class FairseqOptimizer(object):
         """
         raise NotImplementedError
 
+    @property
+    def params(self):
+        """Return an iterable of the parameters held by the optimizer."""
+        for param_group in self.optimizer.param_groups:
+            for p in param_group['params']:
+                yield p
+
+    def __getstate__(self):
+        return self._optimizer.__getstate__()
+
     def get_lr(self):
         """Return the current learning rate."""
         return self.optimizer.param_groups[0]['lr']
@@ -52,7 +61,7 @@ class FairseqOptimizer(object):
         """Return the optimizer's state dict."""
         return self.optimizer.state_dict()
 
-    def load_state_dict(self, state_dict):
+    def load_state_dict(self, state_dict, optimizer_overrides=None):
         """Load an optimizer state dict.
 
         In general we should prefer the configuration of the existing optimizer
@@ -62,14 +71,43 @@ class FairseqOptimizer(object):
         """
         self.optimizer.load_state_dict(state_dict)
 
-        # override learning rate, momentum, etc. with latest values
-        for group in self.optimizer.param_groups:
-            group.update(self.optimizer_config)
+        if optimizer_overrides is not None and len(optimizer_overrides) > 0:
+            # override learning rate, momentum, etc. with latest values
+            for group in self.optimizer.param_groups:
+                group.update(optimizer_overrides)
+
+    def backward(self, loss):
+        """Computes the sum of gradients of the given tensor w.r.t. graph leaves."""
+        loss.backward()
+
+    def multiply_grads(self, c):
+        """Multiplies grads by a constant *c*."""
+        for p in self.params:
+            if p.grad is not None:
+                p.grad.data.mul_(c)
+
+    def clip_grad_norm(self, max_norm):
+        """Clips gradient norm."""
+        if max_norm > 0:
+            return torch.nn.utils.clip_grad_norm_(self.params, max_norm)
+        else:
+            return math.sqrt(sum(p.grad.data.norm()**2 for p in self.params if p.grad is not None))
 
     def step(self, closure=None):
         """Performs a single optimization step."""
-        return self.optimizer.step(closure)
+        self.optimizer.step(closure)
 
     def zero_grad(self):
         """Clears the gradients of all optimized parameters."""
-        return self.optimizer.zero_grad()
+        for p in self.params:
+            p.grad = None
+        self.optimizer.zero_grad()
+
+    @property
+    def supports_memory_efficient_fp16(self):
+        if hasattr(self.optimizer, 'supports_memory_efficient_fp16'):
+            return self.optimizer.supports_memory_efficient_fp16
+        return False
+
+    def average_params(self):
+        pass

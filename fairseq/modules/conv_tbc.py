@@ -1,9 +1,7 @@
-# Copyright (c) 2017-present, Facebook, Inc.
-# All rights reserved.
+# Copyright (c) Facebook, Inc. and its affiliates.
 #
-# This source code is licensed under the license found in the LICENSE file in
-# the root directory of this source tree. An additional grant of patent rights
-# can be found in the PATENTS file in the same directory.
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
 
 import torch
 from torch.nn.modules.utils import _single
@@ -27,7 +25,7 @@ class ConvTBC(torch.nn.Module):
         self.bias = torch.nn.Parameter(torch.Tensor(out_channels))
 
     def forward(self, input):
-        return input.contiguous().conv_tbc(self.weight, self.bias, self.padding[0])
+        return torch.conv_tbc(input.contiguous(), self.weight, self.bias, self.padding[0])
 
     def __repr__(self):
         s = ('{name}({in_channels}, {out_channels}, kernel_size={kernel_size}'

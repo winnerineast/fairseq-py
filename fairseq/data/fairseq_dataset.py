@@ -1,14 +1,21 @@
-# Copyright (c) 2017-present, Facebook, Inc.
-# All rights reserved.
+# Copyright (c) Facebook, Inc. and its affiliates.
 #
-# This source code is licensed under the license found in the LICENSE file in
-# the root directory of this source tree. An additional grant of patent rights
-# can be found in the PATENTS file in the same directory.
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
 
+import numpy as np
 import torch.utils.data
 
 
-class FairseqDataset(torch.utils.data.Dataset):
+class EpochListening:
+    """Mixin for receiving updates whenever the epoch increments."""
+    def set_epoch(self, epoch):
+        """Will receive the updated epoch number at the beginning of the epoch.
+        """
+        pass
+
+
+class FairseqDataset(torch.utils.data.Dataset, EpochListening):
     """A dataset that provides helpers for batching."""
 
     def __getitem__(self, index):
@@ -18,21 +25,48 @@ class FairseqDataset(torch.utils.data.Dataset):
         raise NotImplementedError
 
     def collater(self, samples):
-        """Merge a list of samples to form a mini-batch."""
-        raise NotImplementedError
+        """Merge a list of samples to form a mini-batch.
 
-    def get_dummy_batch(self, num_tokens, max_positions):
-        """Return a dummy batch with a given number of tokens."""
+        Args:
+            samples (List[dict]): samples to collate
+
+        Returns:
+            dict: a mini-batch suitable for forwarding with a Model
+        """
         raise NotImplementedError
 
     def num_tokens(self, index):
-        """Return an example's length (number of tokens), used for batching."""
+        """Return the number of tokens in a sample. This value is used to
+        enforce ``--max-tokens`` during batching."""
+        raise NotImplementedError
+
+    def size(self, index):
+        """Return an example's size as a float or tuple. This value is used when
+        filtering a dataset with ``--max-positions``."""
         raise NotImplementedError
 
     def ordered_indices(self):
-        """Ordered indices for batching."""
+        """Return an ordered list of indices. Batches will be constructed based
+        on this order."""
+        return np.arange(len(self))
+
+    @property
+    def supports_prefetch(self):
+        """Whether this dataset supports prefetching."""
+        return False
+
+    def attr(self, attr: str, index: int):
+        return getattr(self, attr, None)
+
+    def prefetch(self, indices):
+        """Prefetch the data required for this epoch."""
         raise NotImplementedError
 
-    def valid_size(self, index, max_positions):
-        """Check if an example's size is valid according to max_positions."""
+
+class FairseqIterableDataset(torch.utils.data.IterableDataset, EpochListening):
+    """For datasets that need to be read sequentially, usually because the data
+    is being streamed or otherwise can't be manipulated on a single machine.
+    """
+
+    def __iter__(self):
         raise NotImplementedError

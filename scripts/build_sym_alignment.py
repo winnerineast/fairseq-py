@@ -1,11 +1,7 @@
-# Copyright (c) 2017-present, Facebook, Inc.
-# All rights reserved.
+# Copyright (c) Facebook, Inc. and its affiliates.
 #
-# This source code is licensed under the license found in the LICENSE file in
-# the root directory of this source tree. An additional grant of patent rights
-# can be found in the PATENTS file in the same directory.
-#
-
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
 """
 Use this script in order to build symmetric alignments for your translation
 dataset.
@@ -32,6 +28,7 @@ from itertools import zip_longest
 
 def main():
     parser = argparse.ArgumentParser(description='symmetric alignment builer')
+    # fmt: off
     parser.add_argument('--fast_align_dir',
                         help='path to fast_align build directory')
     parser.add_argument('--mosesdecoder_dir',
@@ -47,6 +44,7 @@ def main():
                              'in the target language')
     parser.add_argument('--output_dir',
                         help='output directory')
+    # fmt: on
     args = parser.parse_args()
 
     fast_align_bin = os.path.join(args.fast_align_dir, 'fast_align')
@@ -57,8 +55,8 @@ def main():
 
     # create joined file
     joined_file = os.path.join(args.output_dir, 'text.joined')
-    with open(args.source_file, 'r') as src, open(args.target_file, 'r') as tgt:
-        with open(joined_file, 'w') as joined:
+    with open(args.source_file, 'r', encoding='utf-8') as src, open(args.target_file, 'r', encoding='utf-8') as tgt:
+        with open(joined_file, 'w', encoding='utf-8') as joined:
             for s, t in zip_longest(src, tgt):
                 print('{} ||| {}'.format(s.strip(), t.strip()), file=joined)
 

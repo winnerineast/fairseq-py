@@ -1,9 +1,7 @@
-# Copyright (c) 2017-present, Facebook, Inc.
-# All rights reserved.
+# Copyright (c) Facebook, Inc. and its affiliates.
 #
-# This source code is licensed under the license found in the LICENSE file in
-# the root directory of this source tree. An additional grant of patent rights
-# can be found in the PATENTS file in the same directory.
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
 
 import torch
 import torch.nn.functional as F
@@ -29,13 +27,13 @@ class LinearizedConvolution(ConvTBC):
 
     def forward(self, input, incremental_state=None):
         """
-        Input:
-            Time x Batch x Channel during training
-            Batch x Time x Channel during inference
         Args:
             incremental_state: Used to buffer signal; if not None, then input is
                 expected to contain a single frame. If the input order changes
                 between time steps, call reorder_incremental_state.
+        Input:
+            Time x Batch x Channel during training
+            Batch x Time x Channel during inference
         """
         if incremental_state is None:
             output = super().forward(input)
@@ -82,7 +80,7 @@ class LinearizedConvolution(ConvTBC):
             kw = self.kernel_size[0]
             weight = self.weight.transpose(2, 1).transpose(1, 0).contiguous()
             assert weight.size() == (self.out_channels, kw, self.in_channels)
-            self._linearized_weight = weight.view(self.out_channels, -1)
+            self._linearized_weight = torch.nn.Parameter(weight.view(self.out_channels, -1))
         return self._linearized_weight
 
     def _clear_linearized_weight(self, *args):
